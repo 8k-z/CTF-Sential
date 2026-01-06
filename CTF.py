@@ -14,6 +14,10 @@ import discord
 import requests
 from discord import app_commands
 from discord.ext import commands, tasks
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # ==============================================================================
 # Configuration & Constants
