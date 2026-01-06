@@ -248,271 +248,37 @@ def extract_discord_link_from_description(event: dict) -> Optional[str]:
     return None
 
 # ==============================================================================
-# Guild Configuration Logic
+# Helper Functions & Utilities
 # ==============================================================================
 
-def get_guild_config(guild_id: int) -> dict:
-    """Get guild configuration with default values"""
-    if guild_id not in data_manager.guild_configs:
-        data_manager.guild_configs[guild_id] = {
-            "setup_complete": False, "channel_id": None, 
-            "settings": DEFAULT_CONFIG.copy(), "ctf_channels": {},
-            "ctf_credentials": DEFAULT_CTF_CREDENTIALS.copy()
-        }
-    return data_manager.guild_configs[guild_id]
-
-def is_guild_setup_complete(guild_id: int) -> bool:
-    return get_guild_config(guild_id).get("setup_complete", False)
-
-def get_guild_channel_id(guild_id: int) -> Optional[int]:
-    if not is_guild_setup_complete(guild_id): return None
-    return get_guild_config(guild_id).get("channel_id")
-
-def set_guild_channel_id(guild_id: int, channel_id: int):
-    config = get_guild_config(guild_id)
-    config["channel_id"] = channel_id
-    config["setup_complete"] = True
-    log_message(f"✅ Guild {guild_id} setup completed with channel {channel_id}")
-
-def get_guild_setting(guild_id: int, setting: str):
-    config = get_guild_config(guild_id)
-    return config["settings"].get(setting, DEFAULT_CONFIG.get(setting))
-
-def set_guild_setting(guild_id: int, setting: str, value):
-    config = get_guild_config(guild_id)
-    config["settings"][setting] = value
-    log_message(f"🔧 Guild {guild_id} setting '{setting}' set to {value}")
-
-def get_guild_ctf_status(guild_id: int) -> dict:
-    if guild_id not in data_manager.guild_ctf_status:
-        data_manager.guild_ctf_status[guild_id] = {}
-    return data_manager.guild_ctf_status[guild_id]
-
-def is_ctf_joined(guild_id: int, ctf_id: str) -> bool:
-    return get_guild_ctf_status(guild_id).get(ctf_id, {}).get('joined', False)
-
-def is_ctf_skipped(guild_id: int, ctf_id: str) -> bool:
-    status = get_guild_ctf_status(guild_id).get(ctf_id, {})
-    return status.get('skipped', False)
-
-def mark_ctf_joined(guild_id: int, ctf_id: str):
-    status = get_guild_ctf_status(guild_id)
-    if ctf_id not in status: status[ctf_id] = {}
-    status[ctf_id].update({'joined': True, 'skipped': False})
-    status[ctf_id].pop('skip_until', None)
-    log_message(f"✅ CTF {ctf_id} marked as joined for guild {guild_id}")
-
-def mark_ctf_skipped(guild_id: int, ctf_id: str):
-    status = get_guild_ctf_status(guild_id)
-    if ctf_id not in status: status[ctf_id] = {}
-    status[ctf_id].update({'skipped': True, 'joined': False})
-    status[ctf_id].pop('skip_until', None)
-    log_message(f"⏭️ CTF {ctf_id} marked as permanently skipped for guild {guild_id}")
-
-def should_send_notification(guild_id: int, ctf_id: str) -> bool:
-    if is_ctf_joined(guild_id, ctf_id) or is_ctf_skipped(guild_id, ctf_id):
-        return False
-    return True
-
-def get_sent_notifications(guild_id: int) -> dict:
-    if guild_id not in data_manager.sent_notifications:
-        data_manager.sent_notifications[guild_id] = {
-            '24h': set(), '1h': set(), 'channel_1h': set(), 'archived': set()
-        }
-    return data_manager.sent_notifications[guild_id]
-
-def has_notification_been_sent(guild_id: int, ctf_id: str, notification_type: str) -> bool:
-    return ctf_id in get_sent_notifications(guild_id).get(notification_type, set())
-
-def mark_notification_sent(guild_id: int, ctf_id: str, notification_type: str):
-    get_sent_notifications(guild_id)[notification_type].add(ctf_id)
-
 def get_setup_guilds() -> List[int]:
-    return [gid for gid, cfg in data_manager.guild_configs.items() if cfg.get("setup_complete")]
+    """Get list of guilds that have completed setup"""
+    return [int(gid) for gid, cfg in data_manager.guild_configs.items() if cfg.get("setup_complete")]
 
-@tasks.loop(minutes=15)
-async def auto_save_task():
-    """Auto-save persistent data every 15 minutes"""
-    save_all()
-
-def get_guild_admin_roles(guild_id: int) -> list:
-    """Get admin roles that can use CTF buttons"""
-    config = get_guild_config(guild_id)
-    return config["settings"].get("admin_roles", [])
-def set_guild_admin_roles(guild_id: int, role_ids: list):
-    """Set admin roles for CTF button usage"""
-    config = get_guild_config(guild_id)
-    config["settings"]["admin_roles"] = role_ids
-    log_message(f"🔧 Guild {guild_id} admin roles updated: {len(role_ids)} roles")
 def user_has_ctf_permissions(user: discord.Member, guild_id: int) -> bool:
-    """Check if user can use CTF Join/Skip buttons"""
-    # Server administrators always have access
-    if user.guild_permissions.administrator:
-        return True
-    
-    # Check configured admin roles
-    admin_roles = get_guild_admin_roles(guild_id)
-    if not admin_roles:
-        # If no roles configured, fall back to administrator permission
-        return user.guild_permissions.administrator
-    
-    # Check if user has any of the configured admin roles
-    user_role_ids = [role.id for role in user.roles]
-    return any(role_id in user_role_ids for role_id in admin_roles)
-def extract_discord_link_from_description(event: dict) -> str:
-    """Extract Discord invite link from CTF description if available"""
-    description = event.get('description', '')
-    if not description:
-        return None
-    
-    # Common Discord invite patterns
-    import re
-    discord_patterns = [
-        r'https://discord\.gg/[A-Za-z0-9]+',
-        r'https://discord\.com/invite/[A-Za-z0-9]+',
-        r'discord\.gg/[A-Za-z0-9]+',
-        r'discord\.com/invite/[A-Za-z0-9]+'
-    ]
-    
-    for pattern in discord_patterns:
-        match = re.search(pattern, description, re.IGNORECASE)
-        if match:
-            url = match.group(0)
-            # Ensure it starts with https://
-            if not url.startswith('https://'):
-                url = 'https://' + url
-            return url
-    
-    return None
-def parse_ctf_time_to_timestamp(time_str: str) -> Optional[int]:
-    """Parse CTF time string and return Unix timestamp (UTC enforced)"""
-    if not time_str:
-        return None
-    
-    time_formats = [
-        "%Y-%m-%dT%H:%M:%S%z",        
-        "%Y-%m-%dT%H:%M:%S.%f%z",     
-        "%Y-%m-%dT%H:%M:%S",          
-        "%Y-%m-%dT%H:%M:%S.%f"        
-    ]
-    
-    for fmt in time_formats:
-        try:
-            dt = datetime.strptime(time_str, fmt)
-            # If no timezone info, assume UTC
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return int(dt.timestamp())
-        except ValueError:
-            continue
-    
-    # If all parsing fails, try truncating to basic format
-    try:
-        dt = datetime.strptime(time_str[:19], "%Y-%m-%dT%H:%M:%S")
-        dt = dt.replace(tzinfo=timezone.utc)
-        return int(dt.timestamp())
-    except ValueError:
-        return None
+    """Check if user has permission to manage CTFs"""
+    if user.guild_permissions.administrator: return True
+    admin_roles = get_guild_setting(guild_id, "admin_roles")
+    if not admin_roles: return False
+    return any(role.id in admin_roles for role in user.roles)
 
-def format_discord_timestamp(timestamp: int, style: str = "f") -> str:
-    """Format Unix timestamp as Discord timestamp
-    
-    Styles:
-    - 'f': January 1, 2024 12:00 AM (default)
-    - 'F': Monday, January 1, 2024 12:00 AM
-    - 'd': 01/01/2024
-    - 'D': January 1, 2024
-    - 't': 12:00 AM
-    - 'T': 12:00:00 AM
-    - 'R': 2 hours ago / in 2 hours (relative)
-    """
-    return f"<t:{timestamp}:{style}>"
+def get_ctf_id(event: dict) -> str:
+    """Standardized ID generation for CTFs"""
+    title = event.get('title', 'ctf')
+    eid = event.get('id', 'unk')
+    return f"{title}_{eid}"
 
-def get_ctf_discord_timestamps(event: dict) -> dict:
-    """Get Discord-formatted timestamps for a CTF event"""
-    start_ts = parse_ctf_time_to_timestamp(event.get('start', ''))
-    finish_ts = parse_ctf_time_to_timestamp(event.get('finish', ''))
-    
-    return {
-        'start_timestamp': start_ts,
-        'finish_timestamp': finish_ts,
-        'start_discord': format_discord_timestamp(start_ts, 'F') if start_ts else "Unknown",
-        'finish_discord': format_discord_timestamp(finish_ts, 'F') if finish_ts else "Unknown",
-        'start_relative': format_discord_timestamp(start_ts, 'R') if start_ts else "Unknown",
-        'finish_relative': format_discord_timestamp(finish_ts, 'R') if finish_ts else "Unknown"
-    }
-
-def log_message(message: str):
-    """Log with timestamp - enhanced for better debugging"""
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] {message}")
-
-def get_guild_ctf_status(guild_id: int) -> dict:
-    """Get CTF status tracking for a specific guild"""
-    if guild_id not in guild_ctf_status:
-        guild_ctf_status[guild_id] = {}
-    return guild_ctf_status[guild_id]
-
-def is_ctf_joined(guild_id: int, ctf_id: str) -> bool:
-    """Check if a CTF has been joined in this guild"""
-    guild_status = get_guild_ctf_status(guild_id)
-    return guild_status.get(ctf_id, {}).get('joined', False)
-
-def is_ctf_skipped(guild_id: int, ctf_id: str) -> bool:
-    """Check if a CTF is permanently skipped in this guild"""
-    guild_status = get_guild_ctf_status(guild_id)
-    ctf_status = guild_status.get(ctf_id, {})
-    
-    # Simply return skip status - no time expiration
-    return ctf_status.get('skipped', False)
-
-def mark_ctf_joined(guild_id: int, ctf_id: str):
-    """Mark a CTF as joined in this guild and clear skip status"""
-    guild_status = get_guild_ctf_status(guild_id)
-    if ctf_id not in guild_status:
-        guild_status[ctf_id] = {}
-    guild_status[ctf_id]['joined'] = True
-    guild_status[ctf_id]['skipped'] = False  # Clear skip when joined
-    guild_status[ctf_id].pop('skip_until', None)  # Remove any skip timer
-    log_message(f"✅ CTF {ctf_id} marked as joined for guild {guild_id} (skip status cleared)")
-
-def mark_ctf_skipped(guild_id: int, ctf_id: str):
-    """Mark a CTF as permanently skipped until manually joined"""
-    guild_status = get_guild_ctf_status(guild_id)
-    if ctf_id not in guild_status:
-        guild_status[ctf_id] = {}
-    
-    # Mark as permanently skipped (no time limit)
-    guild_status[ctf_id]['skipped'] = True
-    guild_status[ctf_id]['joined'] = False
-    # Remove any skip_until timestamp - skip permanently
-    guild_status[ctf_id].pop('skip_until', None)
-    
-    log_message(f"⏭️ CTF {ctf_id} marked as permanently skipped for guild {guild_id}")
-    return None  # No skip_until time
-
-def should_send_notification(guild_id: int, ctf_id: str) -> bool:
-    """Check if we should send a notification for this CTF"""
-    # Don't send if already joined
-    if is_ctf_joined(guild_id, ctf_id):
-        return False
-    
-    # Don't send if currently skipped
-    if is_ctf_skipped(guild_id, ctf_id):
-        return False
-    
-    return True
 
 def get_guild_notifications(guild_id: int) -> dict:
     """Get notification tracking for a specific guild"""
-    if guild_id not in sent_notifications:
-        sent_notifications[guild_id] = {
+    if guild_id not in data_manager.sent_notifications:
+        data_manager.sent_notifications[guild_id] = {
             '24h': set(),
             '1h': set(), 
             'channel_1h': set(),  # NEW: Track channel reminders
             'archived': set(),
         }
-    return sent_notifications[guild_id]
+    return data_manager.sent_notifications[guild_id]
 
 def has_notification_been_sent(guild_id: int, ctf_id: str, notification_type: str) -> bool:
     """Check if a notification has been sent for a specific guild"""
@@ -526,15 +292,15 @@ def mark_notification_sent(guild_id: int, ctf_id: str, notification_type: str):
 
 def get_guild_config(guild_id: int) -> dict:
     """Get guild configuration with default values"""
-    if guild_id not in guild_configs:
-        guild_configs[guild_id] = {
+    if guild_id not in data_manager.guild_configs:
+        data_manager.guild_configs[guild_id] = {
             "setup_complete": False,
             "channel_id": None,
             "settings": DEFAULT_CONFIG.copy(),
             "ctf_channels": {},
             "ctf_credentials": DEFAULT_CTF_CREDENTIALS.copy()
         }
-    return guild_configs[guild_id]
+    return data_manager.guild_configs[guild_id]
 
 def is_guild_setup_complete(guild_id: int) -> bool:
     """Check if guild setup is complete"""
@@ -846,7 +612,7 @@ async def on_guild_join(guild: discord.Guild):
 # Graceful shutdown
 async def shutdown():
     log_message("🛑 Saving data before shutdown...")
-    save_all()
+    data_manager.save_all()
     await bot.close()
 
 def signal_handler(sig, frame):
