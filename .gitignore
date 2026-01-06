@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+*.log
+ctf_cache.json
+guild_configs.json
+guild_ctf_status.json
+sent_notifications.json
