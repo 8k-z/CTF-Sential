@@ -268,16 +268,19 @@ def get_ctf_id(event: dict) -> str:
     eid = event.get('id', 'unk')
     return f"{title}_{eid}"
 
-
 def get_guild_notifications(guild_id: int) -> dict:
     """Get notification tracking for a specific guild"""
     if guild_id not in data_manager.sent_notifications:
         data_manager.sent_notifications[guild_id] = {
             '24h': set(),
             '1h': set(), 
-            'channel_1h': set(),  # NEW: Track channel reminders
+            'channel_1h': set(),
             'archived': set(),
+            'test': set(),  # For test notifications
         }
+    # Ensure 'test' key exists for legacy data
+    if 'test' not in data_manager.sent_notifications[guild_id]:
+        data_manager.sent_notifications[guild_id]['test'] = set()
     return data_manager.sent_notifications[guild_id]
 
 def has_notification_been_sent(guild_id: int, ctf_id: str, notification_type: str) -> bool:
@@ -350,6 +353,49 @@ def get_ctf_channel(guild_id: int, ctf_id: str) -> Optional[int]:
     """Get CTF channel ID"""
     config = get_guild_config(guild_id)
     return config["ctf_channels"].get(ctf_id)
+
+def get_guild_ctf_status(guild_id: int) -> dict:
+    """Get CTF status tracking for a specific guild"""
+    if guild_id not in data_manager.guild_ctf_status:
+        data_manager.guild_ctf_status[guild_id] = {}
+    return data_manager.guild_ctf_status[guild_id]
+
+def is_ctf_joined(guild_id: int, ctf_id: str) -> bool:
+    """Check if a CTF has been joined in this guild"""
+    guild_status = get_guild_ctf_status(guild_id)
+    return guild_status.get(ctf_id, {}).get('joined', False)
+
+def is_ctf_skipped(guild_id: int, ctf_id: str) -> bool:
+    """Check if a CTF is permanently skipped in this guild"""
+    guild_status = get_guild_ctf_status(guild_id)
+    ctf_status = guild_status.get(ctf_id, {})
+    return ctf_status.get('skipped', False)
+
+def mark_ctf_joined(guild_id: int, ctf_id: str):
+    """Mark a CTF as joined in this guild and clear skip status"""
+    guild_status = get_guild_ctf_status(guild_id)
+    if ctf_id not in guild_status:
+        guild_status[ctf_id] = {}
+    guild_status[ctf_id]['joined'] = True
+    guild_status[ctf_id]['skipped'] = False
+    guild_status[ctf_id].pop('skip_until', None)
+    log_message(f"✅ CTF {ctf_id} marked as joined for guild {guild_id}")
+
+def mark_ctf_skipped(guild_id: int, ctf_id: str):
+    """Mark a CTF as permanently skipped"""
+    guild_status = get_guild_ctf_status(guild_id)
+    if ctf_id not in guild_status:
+        guild_status[ctf_id] = {}
+    guild_status[ctf_id]['skipped'] = True
+    guild_status[ctf_id]['joined'] = False
+    guild_status[ctf_id].pop('skip_until', None)
+    log_message(f"⏭️ CTF {ctf_id} marked as permanently skipped for guild {guild_id}")
+
+def should_send_notification(guild_id: int, ctf_id: str) -> bool:
+    """Check if we should send a notification for this CTF"""
+    if is_ctf_joined(guild_id, ctf_id) or is_ctf_skipped(guild_id, ctf_id):
+        return False
+    return True
 
 # ==============================================================================
 # Interaction Views
@@ -514,6 +560,17 @@ async def fetch_and_cache_ctfs():
         if response.status_code == 200:
             events = response.json()
             new_cache = {get_ctf_id(e): e for e in events}
+            
+            # Preserve test CTFs that haven't expired yet
+            now = datetime.now(timezone.utc)
+            for cid, event in list(data_manager.ctf_cache.items()):
+                if cid.startswith('test_'):
+                    finish_ts = parse_ctf_time_to_timestamp(event.get('finish'))
+                    if finish_ts:
+                        finish_dt = datetime.fromtimestamp(finish_ts, timezone.utc)
+                        if finish_dt > now:  # Still active
+                            new_cache[cid] = event
+            
             data_manager.ctf_cache = new_cache
             data_manager.save_ctf_cache()
             log_message(f"✅ Fetched {len(events)} CTFs from API")
@@ -585,24 +642,73 @@ async def notification_check_task():
 async def auto_save_task():
     data_manager.save_all()
 
+@tasks.loop(minutes=5)
+async def archive_channels_task():
+    """Background task to move finished CTF channels to archive category"""
+    now = datetime.now(timezone.utc)
+    for gid in get_setup_guilds():
+        guild = bot.get_guild(gid)
+        if not guild: continue
+        
+        if not get_guild_setting(gid, 'auto_archive'): continue
+        delay_mins = get_guild_setting(gid, 'archive_delay')
+        
+        # Get registered channels for this guild
+        config = get_guild_config(gid)
+        ctf_channels = list(config.get("ctf_channels", {}).items())
+        
+        for cid, channel_id in ctf_channels:
+            # Skip if already archived in this session
+            if has_notification_been_sent(gid, cid, 'archived'): continue
+            
+            # Get event data
+            event = data_manager.ctf_cache.get(cid)
+            if not event: continue
+            
+            finish_ts = parse_ctf_time_to_timestamp(event.get('finish'))
+            if not finish_ts: continue
+            
+            finish_dt = datetime.fromtimestamp(finish_ts, timezone.utc)
+            mins_since_finish = (now - finish_dt).total_seconds() / 60
+            
+            if mins_since_finish >= delay_mins:
+                channel = guild.get_channel(channel_id)
+                if channel:
+                    archive_cat = await get_or_create_category(guild, ARCHIVE_CATEGORY_NAME)
+                    if archive_cat:
+                        try:
+                            await channel.edit(category=archive_cat, reason="CTF completed (auto-archive)")
+                            mark_notification_sent(gid, cid, 'archived')
+                            log_message(f"📁 Archived channel #{channel.name} in guild {guild.name}")
+                            
+                            # Optional: Send a final message to the channel
+                            await channel.send("🔒 **CTF Over.** This channel has been automatically archived.")
+                        except Exception as e:
+                            log_message(f"❌ Error archiving channel {channel_id}: {e}")
+
 @bot.event
 async def on_ready():
     log_message(f"🤖 Bot logged in as {bot.user.name}")
-    data_manager.load_all()
     
-    # Restore persistent views
-    for cid in data_manager.ctf_cache:
-        bot.add_view(CTFActionButtons(cid))
-    
+    # Sync commands FIRST (before loading data) to avoid timeouts
     try:
         synced = await bot.tree.sync()
         log_message(f"✅ Synced {len(synced)} slash commands")
     except Exception as e:
         log_message(f"❌ Sync error: {e}")
     
+    # Load persistent data
+    data_manager.load_all()
+    
+    # Restore persistent views
+    for cid in data_manager.ctf_cache:
+        bot.add_view(CTFActionButtons(cid))
+    
+    # Start background tasks
     api_fetch_task.start()
     notification_check_task.start()
     auto_save_task.start()
+    archive_channels_task.start()
 
 @bot.event
 async def on_guild_join(guild: discord.Guild):
@@ -631,13 +737,15 @@ signal.signal(signal.SIGTERM, signal_handler)
 @app_commands.describe(channel="Notification channel")
 @app_commands.default_permissions(administrator=True)
 async def slash_setup_bot(interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None):
+    await interaction.response.defer()  # Defer to avoid timeout
+    
     ch = channel or interaction.channel
     set_guild_channel_id(interaction.guild.id, ch.id)
     get_guild_config(interaction.guild.id)["setup_complete"] = True
     
     embed = discord.Embed(title="🚀 Setup Complete", color=discord.Color.green())
     embed.description = f"Notifications will be sent to {ch.mention}."
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
     
     await fetch_and_cache_ctfs()
     await check_notification_triggers()
@@ -648,21 +756,69 @@ async def slash_team_details(interaction: discord.Interaction, user: str, email:
     set_guild_credentials(interaction.guild.id, {"user": user, "email": email, "pass": "random"})
     await interaction.response.send_message("✅ Team credentials updated.", ephemeral=True)
 
-@bot.tree.command(name="bot_settings", description="Configure preferences")
+@bot.tree.command(name="bot_settings", description="Configure server preferences")
+@app_commands.describe(
+    n24h="Enable 24-hour notifications",
+    n1h="Enable 1-hour notifications",
+    auto_archive="Automatically archive channels when CTF ends",
+    archive_delay="Delay in minutes before archiving (e.g., 60)"
+)
 @app_commands.default_permissions(administrator=True)
 async def slash_bot_settings(interaction: discord.Interaction, 
-                             n24h: Optional[bool] = None, n1h: Optional[bool] = None):
+                             n24h: Optional[bool] = None, n1h: Optional[bool] = None,
+                             auto_archive: Optional[bool] = None, archive_delay: Optional[int] = None):
     gid = interaction.guild.id
     if n24h is not None: set_guild_setting(gid, "notification_24h", n24h)
     if n1h is not None: set_guild_setting(gid, "notification_1h", n1h)
+    if auto_archive is not None: set_guild_setting(gid, "auto_archive", auto_archive)
+    if archive_delay is not None: set_guild_setting(gid, "archive_delay", archive_delay)
     await interaction.response.send_message("✅ Settings updated.", ephemeral=True)
 
 @bot.tree.command(name="ctf_reset_notifications", description="Clear notification history")
 @app_commands.default_permissions(administrator=True)
 async def slash_reset_notifications(interaction: discord.Interaction):
     gid = interaction.guild.id
-    data_manager.sent_notifications[str(gid)] = {"24h": [], "1h": [], "channel_1h": [], "archived": []}
+    data_manager.sent_notifications[gid] = {"24h": set(), "1h": set(), "channel_1h": set(), "archived": set()}
     await interaction.response.send_message("🔄 Notification history reset.", ephemeral=True)
+
+@bot.tree.command(name="ctf_reset_status", description="Clear all CTF join/skip statuses")
+@app_commands.default_permissions(administrator=True)
+async def slash_reset_status(interaction: discord.Interaction):
+    gid = interaction.guild.id
+    data_manager.guild_ctf_status[gid] = {}
+    await interaction.response.send_message("🔄 All CTF statuses (joined/skipped) have been reset.", ephemeral=True)
+
+@bot.tree.command(name="ctf_test_notification", description="Send a test notification to verify setup")
+@app_commands.default_permissions(administrator=True)
+async def slash_test_notification(interaction: discord.Interaction):
+    channel_id = get_guild_channel_id(interaction.guild.id)
+    if not channel_id:
+        await interaction.response.send_message("❌ Setup not complete! Run `/bot_setup` first.", ephemeral=True)
+        return
+        
+    channel = bot.get_channel(channel_id)
+    if not channel:
+        await interaction.response.send_message("❌ Could not find notification channel. Re-run `/bot_setup`.", ephemeral=True)
+        return
+        
+    await interaction.response.send_message("📡 Sending test notification (Ends in 5 mins for archive test)...", ephemeral=True)
+    
+    # Use a fixed ID for the test CTF
+    test_id = "test_ctf"
+    test_event = {
+        'title': 'Test CTF Event',
+        'url': 'https://ctftime.org',
+        'description': 'This is a test notification. **Testing Auto-Archive in 5 minutes!**',
+        'start': datetime.now(timezone.utc).isoformat(),
+        'finish': (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
+        'id': 'test'
+    }
+    
+    # Add to cache so buttons work
+    data_manager.ctf_cache[test_id] = test_event
+    data_manager.save_ctf_cache()
+    
+    await send_guild_notification(interaction.guild.id, test_id, test_event, "test")
 
 @bot.tree.command(name="generate_password", description="Get a secure password")
 async def slash_generate_password(interaction: discord.Interaction, length: int = 12):
